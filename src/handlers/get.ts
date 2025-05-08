@@ -1,4 +1,4 @@
-import { make_resource_path, isMacOSSystemFile, calcContentRange } from '../utils'
+import { make_resource_path, isMacOSSystemFile, log, logError } from '../utils'
 import { listAll } from '../r2-adapter'
 
 export async function handle_head(req: Request, bucket: R2Bucket): Promise<Response> {
@@ -13,7 +13,14 @@ export async function handle_get(req: Request, bucket: R2Bucket): Promise<Respon
 	if (isMacOSSystemFile(resource_path)) {
 		return new Response(new Uint8Array(), {
 			status: 200,
-			headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': '0', 'X-Apple-WebDAV-Compatibility': '1', 'Accept-Ranges': 'bytes' },
+			headers: {
+				'Content-Type': 'application/octet-stream',
+				'Content-Length': '0',
+				'X-Apple-WebDAV-Compatibility': '1',
+				'Accept-Ranges': 'bytes',
+				'Last-Modified': new Date().toUTCString(),
+				ETag: '"macOS-System-File"',
+			},
 		})
 	}
 
@@ -38,38 +45,119 @@ async function handle_directory_listing(req: Request, bucket: R2Bucket, resource
 	// Template for directory listing
 	var pageSource = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>R2Storage</title><style>*{box-sizing:border-box;}body{padding:10px;font-family:'Segoe UI','Circular','Roboto','Lato','Helvetica Neue','Arial Rounded MT Bold','sans-serif';}a{display:inline-block;width:100%;color:#000;text-decoration:none;padding:5px 10px;cursor:pointer;border-radius:5px;}a:hover{background-color:#60C590;color:white;}a[href="../"]{background-color:#cbd5e1;}</style></head><body><h1>R2 Storage</h1><div>${page}</div></body></html>`
 
-	return new Response(pageSource, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+	return new Response(pageSource, { status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8', 'X-Apple-WebDAV-Compatibility': '1', DAV: '1, 2, 3' } })
 }
 
 async function handle_file_download(req: Request, bucket: R2Bucket, resource_path: string): Promise<Response> {
-	let object = await bucket.get(resource_path, { onlyIf: req.headers, range: req.headers })
+	try {
+		log(`[WebDAV GET] Starting file download for: ${resource_path}`)
+		log(`[WebDAV GET] Request URL: ${req.url}`)
+		log(`[WebDAV GET] Request headers:`, Object.fromEntries(req.headers.entries()))
 
-	let isR2ObjectBody = (object: R2Object | R2ObjectBody): object is R2ObjectBody => {
-		return 'body' in object
-	}
+		// First check if the file exists with a head request
+		const fileExists = await bucket.head(resource_path)
+		if (!fileExists) {
+			log(`[WebDAV GET] File not found: ${resource_path}`)
 
-	if (object === null) return new Response('Not Found', { status: 404 })
-	else if (!isR2ObjectBody(object)) return new Response('Precondition Failed', { status: 412 })
-	else {
-		const { rangeOffset, rangeEnd } = calcContentRange(object)
-		const contentLength = rangeEnd - rangeOffset + 1
-		const filename = resource_path.split('/').pop() || 'file'
+			// Try to list files with similar names to help debug
+			log(`[WebDAV GET] Listing files in bucket to check for similar names:`)
+			const prefix = resource_path.split('/').slice(0, -1).join('/')
+			for await (const object of listAll(bucket, prefix)) log(`[WebDAV GET] Found file in bucket: "${object.key}"`)
 
-		return new Response(object.body, {
-			status: object.range && contentLength !== object.size ? 206 : 200,
-			headers: {
-				'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
-				'Content-Length': contentLength.toString(),
-				'Content-Range': object.range ? `bytes ${rangeOffset}-${rangeEnd}/${object.size}` : '',
-				'Content-Disposition': object.httpMetadata?.contentDisposition || `inline; filename="${filename}"`,
-				'Accept-Ranges': 'bytes',
-				'X-Apple-WebDAV-Compatibility': '1',
-				...(object.httpMetadata?.contentEncoding ? { 'Content-Encoding': object.httpMetadata.contentEncoding } : {}),
-				...(object.httpMetadata?.contentLanguage ? { 'Content-Language': object.httpMetadata.contentLanguage } : {}),
-				...(object.httpMetadata?.cacheControl ? { 'Cache-Control': object.httpMetadata.cacheControl } : {}),
-				ETag: object.etag,
-				'Last-Modified': object.uploaded.toUTCString(),
-			},
+			return new Response('Not Found', { status: 404 })
+		}
+		log(`[WebDAV GET] File exists, size: ${fileExists.size}, etag: ${fileExists.etag}`)
+
+		// Use range headers if present, otherwise get the full file
+		const rangeHeader = req.headers.get('Range')
+		log(`[WebDAV GET] Range header: ${rangeHeader || 'none'}`)
+
+		let object
+		try {
+			if (rangeHeader) {
+				log(`[WebDAV GET] Fetching with range: ${rangeHeader}`)
+				object = await bucket.get(resource_path, { range: rangeHeader, onlyIf: req.headers })
+			} else {
+				log(`[WebDAV GET] Fetching entire file`)
+				object = await bucket.get(resource_path, { onlyIf: req.headers })
+			}
+		} catch (fetchError: any) {
+			logError(`[WebDAV GET] Error fetching from R2:`, fetchError)
+			return new Response(`Error retrieving file: ${fetchError.message}`, { status: 500 })
+		}
+
+		if (object === null) {
+			log(`[WebDAV GET] Object not found after HEAD check succeeded`)
+			return new Response('Not Found', { status: 404 })
+		}
+
+		// Check if the object is an R2ObjectBody
+		if ('body' in object === false) {
+			log(`[WebDAV GET] Object has no body, type:`, typeof object)
+			return new Response('No Content', { status: 204 })
+		}
+
+		// Log object properties
+		log(`[WebDAV GET] Object retrieved:`, {
+			key: object.key,
+			size: object.size,
+			etag: object.etag,
+			range: object.range,
+			httpMetadata: object.httpMetadata,
 		})
+
+		const filename = resource_path.split('/').pop() || 'file'
+		const isPartial = rangeHeader && object.range
+
+		let status = 200
+		const headers: Record<string, string> = {
+			'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+			'Content-Length': object.size.toString(),
+			'Accept-Ranges': 'bytes',
+			'Last-Modified': object.uploaded.toUTCString(),
+			ETag: object.etag || `"${resource_path}-${object.size}"`,
+			'Cache-Control': 'private, max-age=0',
+			'Content-Disposition': `attachment; filename="${filename}"`,
+			'X-Apple-WebDAV-Compatibility': '1',
+			'X-WebDAV-Writable': 'true',
+		}
+
+		// Handle range requests
+		if (isPartial) {
+			status = 206
+			const range = object.range as any
+			console.log(`[WebDAV GET] Processing partial response with range:`, range)
+
+			if ('offset' in range && 'length' in range) {
+				const offset = range.offset || 0
+				const length = range.length || 0
+				const end = offset + length - 1
+				headers['Content-Range'] = `bytes ${offset}-${end}/${object.size}`
+				headers['Content-Length'] = length.toString()
+				console.log(`[WebDAV GET] Range parameters: offset=${offset}, length=${length}, end=${end}`)
+			} else if ('suffix' in range) {
+				const suffix = range.suffix || 0
+				const offset = Math.max(0, object.size - suffix)
+				const end = object.size - 1
+				headers['Content-Range'] = `bytes ${offset}-${end}/${object.size}`
+				headers['Content-Length'] = (end - offset + 1).toString()
+				console.log(`[WebDAV GET] Suffix range: suffix=${suffix}, offset=${offset}, end=${end}`)
+			} else console.log(`[WebDAV GET] Unexpected range format:`, range)
+		}
+
+		log(`[WebDAV GET] Returning response with status ${status} and headers:`, headers)
+
+		// Return the response with streaming body
+		return new Response('body' in object ? object.body : null, { status, headers })
+	} catch (error: any) {
+		logError(`[WebDAV GET] Unhandled error in file download:`, {
+			error: error.message,
+			stack: error.stack,
+			resourcePath: resource_path,
+			requestURL: req.url,
+			requestMethod: req.method,
+			headers: Object.fromEntries(req.headers.entries()),
+		})
+		return new Response('Internal Server Error', { status: 500, headers: { 'Content-Type': 'text/plain', 'X-Error-Detail': error.message || 'Unknown error' } })
 	}
 }

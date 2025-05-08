@@ -2,6 +2,7 @@ export interface Env {
 	bucket: R2Bucket
 	USERNAME: string
 	PASSWORD: string
+	LOGGING?: string
 }
 
 export type DavProperties = {
@@ -19,6 +20,11 @@ export type DavProperties = {
 	quota?: string
 	quotaused?: string
 	executable?: string
+}
+
+export interface WebDAVError extends Error {
+	statusCode: number
+	headers?: Record<string, string>
 }
 
 export const DAV_CLASS = '1, 2, 3'

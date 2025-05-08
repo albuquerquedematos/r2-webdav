@@ -1,5 +1,5 @@
 import { Env, SUPPORT_METHODS, DAV_CLASS } from './types'
-import { is_authorized, handle_options } from './utils'
+import { is_authorized, handle_options, log } from './utils'
 
 // Import handlers
 import {
@@ -17,6 +17,9 @@ import {
 } from './handlers'
 
 async function dispatch_handler(req: Request, bucket: R2Bucket): Promise<Response> {
+	// Log request information if logging is enabled
+	log(`[WebDAV] ${req.method} request for ${req.url}`)
+	
 	//prettier-ignore
 	switch (req.method) {
 		case 'OPTIONS':   return       handle_options(req)
@@ -57,7 +60,9 @@ export default {
 		response.headers.set('Access-Control-Allow-Methods', SUPPORT_METHODS.join(', '))
 		response.headers.set(
 			'Access-Control-Allow-Headers',
-			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range', 'if', 'lock-token', 'timeout', 'translate'].join(', ')
+			['authorization', 'content-type', 'depth', 'overwrite', 'destination', 'range', 'if', 'lock-token', 'timeout', 'translate', 'if-modified-since'].join(
+				', '
+			)
 		)
 		response.headers.set(
 			'Access-Control-Expose-Headers',
@@ -69,6 +74,7 @@ export default {
 		// Add macOS WebDAV compatibility headers
 		response.headers.set('X-Apple-WebDAV-Compatibility', '1')
 		response.headers.set('X-WebDAV-Writable', 'true')
+		response.headers.set('X-Finder-WebDAV-Interoperability', 'accept-ranges,resource-fork')
 
 		// Add MS Office compatibility headers
 		response.headers.set('MS-Author-Via', 'DAV')
