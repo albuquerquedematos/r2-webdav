@@ -10,6 +10,11 @@ r2_buckets = [
   { binding = "bucket", bucket_name = "dev-public", preview_bucket_name = "Storage Bucket (Public)" },
 ]
 
+# Increase the size limit for uploads
+[limits]
+upload_size = "100MB"
+cpu_ms = 50
+
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs
 [observability]
 enabled = true

@@ -68,6 +68,10 @@ async function handle_file_download(req: Request, bucket: R2Bucket, resource_pat
 		}
 		log(`[WebDAV GET] File exists, size: ${fileExists.size}, etag: ${fileExists.etag}`)
 
+			// Detect if this is a Finder request
+		const isFinderRequest = req.headers.get('User-Agent')?.includes('WebDAVFS') || false
+		log(`[WebDAV GET] Request from Finder: ${isFinderRequest}`)
+
 		// Use range headers if present, otherwise get the full file
 		const rangeHeader = req.headers.get('Range')
 		log(`[WebDAV GET] Range header: ${rangeHeader || 'none'}`)
@@ -116,17 +120,23 @@ async function handle_file_download(req: Request, bucket: R2Bucket, resource_pat
 			'Accept-Ranges': 'bytes',
 			'Last-Modified': object.uploaded.toUTCString(),
 			ETag: object.etag || `"${resource_path}-${object.size}"`,
-			'Cache-Control': 'private, max-age=0',
-			'Content-Disposition': `attachment; filename="${filename}"`,
+			'Cache-Control': 'no-cache',
 			'X-Apple-WebDAV-Compatibility': '1',
 			'X-WebDAV-Writable': 'true',
+		}
+
+		// For macOS Finder, use inline disposition instead of attachment
+		if (isFinderRequest) {
+			headers['Content-Disposition'] = `inline; filename="${filename}"`
+		} else {
+			headers['Content-Disposition'] = `attachment; filename="${filename}"`
 		}
 
 		// Handle range requests
 		if (isPartial) {
 			status = 206
 			const range = object.range as any
-			console.log(`[WebDAV GET] Processing partial response with range:`, range)
+			log(`[WebDAV GET] Processing partial response with range:`, range)
 
 			if ('offset' in range && 'length' in range) {
 				const offset = range.offset || 0
@@ -134,20 +144,36 @@ async function handle_file_download(req: Request, bucket: R2Bucket, resource_pat
 				const end = offset + length - 1
 				headers['Content-Range'] = `bytes ${offset}-${end}/${object.size}`
 				headers['Content-Length'] = length.toString()
-				console.log(`[WebDAV GET] Range parameters: offset=${offset}, length=${length}, end=${end}`)
+				log(`[WebDAV GET] Range parameters: offset=${offset}, length=${length}, end=${end}`)
 			} else if ('suffix' in range) {
 				const suffix = range.suffix || 0
 				const offset = Math.max(0, object.size - suffix)
 				const end = object.size - 1
 				headers['Content-Range'] = `bytes ${offset}-${end}/${object.size}`
 				headers['Content-Length'] = (end - offset + 1).toString()
-				console.log(`[WebDAV GET] Suffix range: suffix=${suffix}, offset=${offset}, end=${end}`)
-			} else console.log(`[WebDAV GET] Unexpected range format:`, range)
+				log(`[WebDAV GET] Suffix range: suffix=${suffix}, offset=${offset}, end=${end}`)
+			} else {
+				log(`[WebDAV GET] Unexpected range format:`, range)
+			}
 		}
 
 		log(`[WebDAV GET] Returning response with status ${status} and headers:`, headers)
 
-		// Return the response with streaming body
+		// For macOS clients, explicitly stream the body without any transforms
+		if (isFinderRequest && 'body' in object && object.body instanceof ReadableStream) {
+			// Create a new Headers object from the record
+			const responseHeaders = new Headers();
+			for (const [key, value] of Object.entries(headers)) {
+				responseHeaders.set(key, value);
+			}
+			
+			return new Response(object.body, {
+				status,
+				headers: responseHeaders
+			});
+		}
+		
+		// For other clients or if not a ReadableStream
 		return new Response('body' in object ? object.body : null, { status, headers })
 	} catch (error: any) {
 		logError(`[WebDAV GET] Unhandled error in file download:`, {
